@@ -10,56 +10,44 @@ import type { WorkflowEvent } from "cloudflare:workers";
  *
  * @see https://developers.cloudflare.com/workflows
  */
-export class MyWorkflow extends WorkflowEntrypoint<
-	Env,
-	Record<string, unknown>
-> {
-	async run(event: WorkflowEvent<Record<string, unknown>>, step: WorkflowStep) {
-		const instanceId = event.instanceId;
+export default {
+  async fetch(req, env, ctx) {
+    const url = new URL(req.url);
 
-		// Notify Durable Object of step progress. Called outside step.do, so this
-		// operation may repeat. Safe here because updateStep is idempotent.
-		// Refer to: https://developers.cloudflare.com/workflows/build/rules-of-workflows/
-		const notifyStep = async (
-			stepName: string,
-			status: "running" | "completed" | "waiting",
-		) => {
-			try {
-				const doId = this.env.WORKFLOW_STATUS.idFromName(instanceId);
-				const stub = this.env.WORKFLOW_STATUS.get(doId);
-				await stub.updateStep(stepName, status);
-			} catch {
-				// Silently fail
-			}
-		};
+    // パラメータ（上限付き）
+    const durationMs = Math.min(Number(url.searchParams.get("dur") || 8000), 10000);
+    const rps = Math.min(Number(url.searchParams.get("rps") || 20), 50);
+    const target = env.ORIGIN_URL; // 自分のoriginのみ
 
-		// Step 1: Basic step - shows step.do usage
-		await notifyStep("process data", "running");
-		const result = await step.do("process data", async () => {
-			await new Promise((resolve) => setTimeout(resolve, 1000));
-			return { processed: true, timestamp: Date.now() };
-		});
-		await notifyStep("process data", "completed");
+    const endAt = Date.now() + durationMs;
+    let sent = 0;
 
-		// Step 2: Sleep step - shows step.sleep for delays
-		await notifyStep("wait 2 seconds", "running");
-		await step.sleep("wait 2 seconds", "2 seconds");
-		await notifyStep("wait 2 seconds", "completed");
+    // シンプルなレートループ
+    while (Date.now() < endAt) {
+      const batch = [];
+      for (let i = 0; i < rps; i++) {
+        const u = new URL(target);
+        // キャッシュ回避
+        u.searchParams.set("t", Date.now().toString());
+        u.searchParams.set("r", Math.random().toString(36).slice(2));
 
-		// Step 3: Wait for event - shows interactive step.waitForEvent
-		await notifyStep("wait for approval", "waiting");
-		const approval = await step.waitForEvent("wait for approval", {
-			type: "user-approval",
-			timeout: "60 minutes",
-		});
-		await notifyStep("wait for approval", "completed");
+        batch.push(fetch(u.toString(), {
+          headers: {
+            "Cache-Control": "no-store",
+            "Accept": "application/octet-stream"
+          }
+        }).catch(() => null));
+      }
+      await Promise.all(batch);
+      sent += batch.length;
+      // 1秒刻み
+      await new Promise(r => setTimeout(r, 1000));
+    }
 
-		// Step 4: Final step
-		await notifyStep("final", "running");
-		await step.do("final", async () => {
-			console.log("Results:", { result, approval: approval.payload });
-			await new Promise((resolve) => setTimeout(resolve, 1000));
-		});
-		await notifyStep("final", "completed");
-	}
-}
+    return new Response(JSON.stringify({
+      sent,
+      durationMs,
+      note: "own-origin load probe"
+    }), { headers: { "content-type": "application/json" }});
+  }
+};
